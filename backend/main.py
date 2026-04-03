@@ -6,6 +6,7 @@ Sessions are purged immediately after SOAP note generation.
 
 Endpoints:
   POST /session/start    — create a new intake session
+  POST /session/greeting — get the opening message (no user input needed)
   POST /session/chat     — send a patient message, get agent reply
   POST /session/complete — synthesize SOAP note, handoff, wipe session
   POST /handoff          — mock EHR receiver
@@ -13,11 +14,13 @@ Endpoints:
 
 from __future__ import annotations
 
+import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,14 +32,30 @@ from backend.models import (
     ChatResponse,
     CompleteRequest,
     CompleteResponse,
+    GreetingRequest,
     HandoffPayload,
     HandoffResponse,
     Message,
     SessionData,
+    SOAPNote,
     StartSessionResponse,
 )
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("gastroflow")
+
+# ---------------------------------------------------------------------------
+# Config from environment
+# ---------------------------------------------------------------------------
+_raw_origins = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000")
+ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
+SESSION_TTL_HOURS = int(os.environ.get("SESSION_TTL_HOURS", "2"))
 
 # ---------------------------------------------------------------------------
 # In-memory session store — the ONLY place patient data lives
@@ -53,9 +72,10 @@ agent: GIAgent
 async def lifespan(app: FastAPI):
     global agent
     agent = GIAgent()
+    logger.info("GastroFlow started. CORS origins: %s", ALLOWED_ORIGINS)
     yield
-    # On shutdown: wipe all sessions defensively
     sessions.clear()
+    logger.info("GastroFlow shutting down — all sessions wiped.")
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +90,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -83,44 +103,52 @@ app.add_middleware(
 
 @app.post("/session/start", response_model=StartSessionResponse)
 async def start_session() -> StartSessionResponse:
-    """
-    Create a new intake session.
-    Returns a session_id (UUID). No patient data is stored yet.
-    """
+    """Create a new intake session. Sweeps expired sessions on each call."""
+    _sweep_expired_sessions()
     session_id = str(uuid.uuid4())
     sessions[session_id] = SessionData(session_id=session_id)
+    logger.info("Session started: %s", session_id)
     return StartSessionResponse(session_id=session_id)
+
+
+@app.post("/session/greeting", response_model=ChatResponse)
+async def session_greeting(request: GreetingRequest) -> ChatResponse:
+    """
+    Return the opening message without requiring a user message.
+    Call this once after /session/start to kick off the conversation.
+    """
+    session = _get_session(request.session_id)
+    reply = agent.greeting()
+    session.messages.append(Message(role="assistant", content=reply))
+    return ChatResponse(reply=reply, red_flags=[], is_complete=False)
 
 
 @app.post("/session/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
-    """
-    Send a patient message and receive the agent's reply.
-
-    Optionally include a bristol_type (1–7) from the visual selector.
-    Red flags are checked on every turn and accumulated in the session.
-    """
+    """Send a patient message and receive the agent's reply."""
     session = _get_session(request.session_id)
 
     if session.is_complete:
         raise HTTPException(status_code=400, detail="Intake session is already complete.")
 
-    # Update Bristol type if the patient used the selector
     if request.bristol_type is not None:
         session.bristol_type = BristolType(request.bristol_type)
 
-    reply, new_red_flags = await agent.chat(session, request.message)
+    try:
+        reply, new_red_flags = await agent.chat(session, request.message)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
-    # Persist this turn to RAM session
     session.messages.append(Message(role="user", content=request.message))
     session.messages.append(Message(role="assistant", content=reply))
 
-    # Merge new red flags (deduplicated)
+    # Deduplicate red flags with a set for O(1) lookup
+    existing = set(session.red_flags)
     for flag in new_red_flags:
-        if flag not in session.red_flags:
+        if flag not in existing:
             session.red_flags.append(flag)
+            existing.add(flag)
 
-    # Detect completion signal from agent
     is_complete = agent.is_intake_complete(reply)
     if is_complete:
         session.is_complete = True
@@ -135,13 +163,11 @@ async def chat(request: ChatRequest) -> ChatResponse:
 @app.post("/session/complete", response_model=CompleteResponse)
 async def complete_session(request: CompleteRequest) -> CompleteResponse:
     """
-    Finalize the intake session:
-    1. Synthesize a SOAP note from the conversation.
-    2. POST the note to the mock EHR /handoff endpoint.
-    3. Wipe the session from RAM.
-    4. Return the SOAP note to the frontend (for display only).
-
-    After this call, all patient data is gone from the server.
+    Finalize the intake:
+    1. Synthesize SOAP note.
+    2. Process EHR handoff.
+    3. Wipe session from RAM.
+    4. Return SOAP note to frontend.
     """
     session = _get_session(request.session_id)
 
@@ -151,34 +177,30 @@ async def complete_session(request: CompleteRequest) -> CompleteResponse:
             detail="Cannot complete an empty session. Start the intake first."
         )
 
-    # Step 1: Synthesize SOAP note
-    soap = await agent.synthesize_soap(session)
+    try:
+        soap = await agent.synthesize_soap(session)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
-    # Step 2: Handoff to mock EHR
-    await _post_to_handoff(soap)
+    # Handoff — direct call, no self-HTTP loop
+    _process_handoff(soap)
 
-    # Step 3: Wipe session from RAM — patient data is gone
+    # Wipe session — patient data is gone
     del sessions[request.session_id]
+    logger.info("Session completed and wiped: %s", request.session_id)
 
-    # Step 4: Return SOAP to frontend
     return CompleteResponse(soap=soap, session_id=request.session_id)
 
 
 @app.post("/handoff", response_model=HandoffResponse)
 async def handoff(payload: HandoffPayload) -> HandoffResponse:
     """
-    Mock EHR endpoint. In production, this would POST to the hospital's
-    EHR system (Epic/Cerner FHIR endpoint, etc.).
-
-    Receives the SOAP note, acknowledges receipt.
-    No patient identifiers are sent — only the clinical note.
+    Mock EHR endpoint. Replace with real EHR integration (Epic/Cerner FHIR) in production.
     """
-    # In production: forward to real EHR system
-    # For MVP: acknowledge receipt
-    urgency_label = payload.soap.urgency.upper()
+    _process_handoff(payload.soap)
     return HandoffResponse(
         received=True,
-        message=f"SOAP note received by EHR. Urgency: {urgency_label}.",
+        message=f"SOAP note received by EHR. Urgency: {payload.soap.urgency.upper()}.",
     )
 
 
@@ -205,16 +227,23 @@ def _get_session(session_id: str) -> SessionData:
     return session
 
 
-async def _post_to_handoff(soap) -> None:
-    """Internal call from /session/complete to /handoff."""
-    async with httpx.AsyncClient() as client:
-        try:
-            await client.post(
-                "http://localhost:8000/handoff",
-                json=HandoffPayload(soap=soap).model_dump(),
-                timeout=10.0,
-            )
-        except httpx.RequestError:
-            # Handoff failure is non-fatal — SOAP note is still returned
-            # In production, implement retry logic or a dead-letter queue
-            pass
+def _process_handoff(soap: SOAPNote) -> None:
+    """
+    Process EHR handoff. Currently a structured log.
+    In production: replace with async POST to real EHR FHIR endpoint.
+    """
+    logger.info(
+        "EHR handoff — urgency=%s red_flags=%d",
+        soap.urgency.upper(),
+        len(soap.red_flags),
+    )
+
+
+def _sweep_expired_sessions() -> None:
+    """Remove sessions older than SESSION_TTL_HOURS to prevent RAM leaks."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=SESSION_TTL_HOURS)
+    expired = [sid for sid, s in sessions.items() if s.created_at < cutoff]
+    for sid in expired:
+        del sessions[sid]
+    if expired:
+        logger.info("Swept %d expired session(s)", len(expired))

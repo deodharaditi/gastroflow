@@ -15,9 +15,10 @@ globally on the Groq client and applied to every request.
 from __future__ import annotations
 
 import json
+import logging
 import os
 
-from groq import AsyncGroq
+from groq import AsyncGroq, APIError, APITimeoutError
 
 from backend.clinical.red_flags import triage_red_flags, get_urgency_level
 from backend.models import Message, SessionData, SOAPNote
@@ -27,8 +28,16 @@ from backend.prompts.soap_synthesis import (
     build_synthesis_user_prompt,
 )
 
+logger = logging.getLogger("gastroflow.agent")
+
 CHAT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 SYNTHESIS_MODEL = "llama-3.3-70b-versatile"
+
+GREETING = (
+    "Welcome to GastroFlow, your pre-appointment gastroenterology intake assistant. "
+    "Everything you share is processed securely and not stored after your session summary is generated.\n\n"
+    "To get started — what is the main symptom or concern that brings you in today?"
+)
 
 
 class GIAgent:
@@ -46,23 +55,24 @@ class GIAgent:
         if not api_key:
             raise RuntimeError(
                 "GROQ_API_KEY is not set. "
-                "Copy backend/.env.example to backend/.env and add your key."
+                "Copy .env.example to .env and add your key."
             )
         self._client = AsyncGroq(
             api_key=api_key,
             default_headers={"X-Groq-Privacy": "zero-retention"},
         )
 
+    def greeting(self) -> str:
+        """Return the fixed opening message — no API call needed."""
+        return GREETING
+
     async def chat(self, session: SessionData, user_message: str) -> tuple[str, list[str]]:
         """
         Process a patient message and return (agent_reply, new_red_flags).
-
-        Red flags found in this turn are returned separately so main.py
-        can merge them into the session without this method touching state.
+        Raises ValueError on Groq API failure so the caller can handle it.
         """
         new_red_flags = triage_red_flags(user_message)
 
-        # Build the messages list for this API call
         groq_messages: list[dict] = [
             {"role": "system", "content": INTAKE_SYSTEM_PROMPT}
         ]
@@ -70,12 +80,22 @@ class GIAgent:
             groq_messages.append({"role": msg.role, "content": msg.content})
         groq_messages.append({"role": "user", "content": user_message})
 
-        response = await self._client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=groq_messages,
-            temperature=0.4,
-            max_tokens=512,
-        )
+        try:
+            response = await self._client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=groq_messages,
+                temperature=0.4,
+                max_tokens=512,
+            )
+        except APITimeoutError:
+            logger.error("Groq chat request timed out")
+            raise ValueError("The AI service timed out. Please try again.")
+        except APIError as e:
+            logger.error("Groq chat API error: %s", e)
+            raise ValueError("The AI service returned an error. Please try again.")
+
+        if not response.choices:
+            raise ValueError("Received an empty response from the AI service.")
 
         reply = response.choices[0].message.content or ""
         return reply, new_red_flags
@@ -92,25 +112,31 @@ class GIAgent:
             red_flags=session.red_flags,
         )
 
-        response = await self._client.chat.completions.create(
-            model=SYNTHESIS_MODEL,
-            messages=[
-                {"role": "system", "content": SOAP_SYNTHESIS_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.1,  # deterministic for clinical accuracy
-            max_tokens=2048,
-            response_format={"type": "json_object"},
-        )
+        try:
+            response = await self._client.chat.completions.create(
+                model=SYNTHESIS_MODEL,
+                messages=[
+                    {"role": "system", "content": SOAP_SYNTHESIS_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+                max_tokens=2048,
+                response_format={"type": "json_object"},
+            )
+        except APITimeoutError:
+            logger.error("Groq synthesis request timed out")
+            raise ValueError("SOAP synthesis timed out. Please try again.")
+        except APIError as e:
+            logger.error("Groq synthesis API error: %s", e)
+            raise ValueError("SOAP synthesis failed. Please try again.")
+
+        if not response.choices:
+            raise ValueError("Received an empty synthesis response from the AI service.")
 
         raw = response.choices[0].message.content or "{}"
         return _parse_soap_response(raw, session)
 
     def is_intake_complete(self, reply: str) -> bool:
-        """
-        Heuristic: detect when the agent signals intake is complete.
-        Matches the trigger phrase from the system prompt.
-        """
         markers = [
             "i have gathered all the information",
             "please click 'complete intake'",
@@ -138,9 +164,9 @@ def _parse_soap_response(raw: str, session: SessionData) -> SOAPNote:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        # Fallback: return a minimal note flagging the parse error
+        logger.warning("Synthesis model returned malformed JSON — using fallback note")
         data = {
-            "subjective": raw,
+            "subjective": "Synthesis parsing failed. Raw model output below.\n\n" + raw,
             "objective": "Bristol Stool Type: " + (
                 str(int(session.bristol_type)) if session.bristol_type else "Not provided"
             ),

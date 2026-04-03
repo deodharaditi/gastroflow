@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from enum import IntEnum
 from typing import Optional
 from pydantic import BaseModel, Field
@@ -33,10 +34,10 @@ class SessionData(BaseModel):
     messages: list[Message] = Field(default_factory=list)
     bristol_type: Optional[BristolType] = None
     red_flags: list[str] = Field(default_factory=list)
-    # Structured symptom fields populated progressively during chat
     chief_complaint: Optional[str] = None
     symptom_duration_months: Optional[float] = None
     is_complete: bool = False
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 # ---------------------------------------------------------------------------
@@ -47,9 +48,13 @@ class StartSessionResponse(BaseModel):
     session_id: str
 
 
+class GreetingRequest(BaseModel):
+    session_id: str
+
+
 class ChatRequest(BaseModel):
     session_id: str
-    message: str
+    message: str = Field(max_length=2000)
     bristol_type: Optional[BristolType] = None
 
 
@@ -79,7 +84,7 @@ class SOAPNote(BaseModel):
 
 class CompleteResponse(BaseModel):
     soap: SOAPNote
-    session_id: str  # for frontend display; session is already wiped server-side
+    session_id: str
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +93,6 @@ class CompleteResponse(BaseModel):
 
 class HandoffPayload(BaseModel):
     soap: SOAPNote
-    # No patient identifiers — only the clinical note
 
 
 class HandoffResponse(BaseModel):

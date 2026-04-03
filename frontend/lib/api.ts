@@ -5,6 +5,7 @@
  */
 
 const API_BASE = "/api";
+const TIMEOUT_MS = 30_000;
 
 export interface ChatMessage {
   role: "user" | "assistant";
@@ -36,29 +37,41 @@ export interface CompleteResponse {
   session_id: string;
 }
 
-export interface HandoffResponse {
-  received: boolean;
-  message: string;
-}
-
 async function post<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
-  if (!res.ok) {
-    const error = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(error.detail ?? "Unknown API error");
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(error.detail ?? "Unknown API error");
+    }
+
+    return res.json() as Promise<T>;
+  } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new Error("Request timed out. Please check your connection and try again.");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
   }
-
-  return res.json() as Promise<T>;
 }
 
 export const api = {
   startSession(): Promise<StartSessionResponse> {
     return post<StartSessionResponse>("/session/start", {});
+  },
+
+  greeting(sessionId: string): Promise<ChatResponse> {
+    return post<ChatResponse>("/session/greeting", { session_id: sessionId });
   },
 
   chat(
